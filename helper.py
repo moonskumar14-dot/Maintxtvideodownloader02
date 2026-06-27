@@ -3,76 +3,122 @@ import subprocess
 import datetime
 import asyncio
 import os
-import requests
 import time
-from p_bar import progress_bar
-from config import LOG
+import shutil
+import requests
 import aiohttp
-import tgcrypto
 import aiofiles
+
+from pathlib import Path
+from p_bar import progress_bar
 from pyrogram.types import Message
-from pyrogram import Client, filters
-import base64
-import urllib.parse
-import threading
-import httpx
-import re
+from pyrogram import Client
 
 
-# pw_token = os.environ.get("token")
-pw_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3MjAwOTY5OTkuODczLCJkYXRhIjp7Il9pZCI6IjYwY2UxMzU0ZDdlMjNjMDAxMTBkYzU1OCIsInVzZXJuYW1lIjoiOTk2NzI2MzMwMyIsImZpcnN0TmFtZSI6IkRldmFuc2giLCJsYXN0TmFtZSI6IkJoYW51c2hhbGkiLCJvcmdhbml6YXRpb24iOnsiX2lkIjoiNWViMzkzZWU5NWZhYjc0NjhhNzlkMTg5Iiwid2Vic2l0ZSI6InBoeXNpY3N3YWxsYWguY29tIiwibmFtZSI6IlBoeXNpY3N3YWxsYWgifSwiZW1haWwiOiJkZXZhbnNoYmhhbnVzaGFsaTEyQGdtYWlsLmNvbSIsInJvbGVzIjpbIjViMjdiZDk2NTg0MmY5NTBhNzc4YzZlZiJdLCJ0eXBlIjoiVVNFUiJ9LCJpYXQiOjE3MTk0OTIxOTl9.T4p_zzFHmL1FYIh7ZddaytjQuvImofVluswVPF1_GFM"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0 Safari/537.36"
+)
+
 
 def duration(filename):
-    result = subprocess.run([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
-        "default=noprint_wrappers=1:nokey=1", filename
-    ],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT)
-    return float(result.stdout)
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filename,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            return 0
+        return int(float(result.stdout.strip()))
+    except Exception as e:
+        logging.error(f"Duration error: {e}")
+        return 0
 
 
 async def download(url, name):
-    ka = f'{name}.pdf'
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                f = await aiofiles.open(ka, mode='wb')
-                await f.write(await resp.read())
-                await f.close()
-    return ka
+    """
+    Download PDF/file from URL.
+    """
+    filename = f"{name}.pdf"
 
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=60, sock_read=120)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers={"User-Agent": USER_AGENT}) as resp:
+            if resp.status != 200:
+                raise Exception(f"Download failed: HTTP {resp.status}")
+
+            async with aiofiles.open(filename, mode="wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                    if chunk:
+                        await f.write(chunk)
+
+    return filename
 
 
 async def run(cmd):
+    """
+    Run Linux shell command async.
+    """
     proc = await asyncio.create_subprocess_shell(
-        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
 
     stdout, stderr = await proc.communicate()
 
-    print(f'[{cmd!r} exited with {proc.returncode}]')
-    if proc.returncode == 1:
+    out = stdout.decode(errors="ignore") if stdout else ""
+    err = stderr.decode(errors="ignore") if stderr else ""
+
+    logging.info(f"CMD exited {proc.returncode}: {cmd}")
+
+    if out:
+        logging.info(out)
+    if err:
+        logging.error(err)
+
+    if proc.returncode != 0:
         return False
-    if stdout:
-        return f'[stdout]\n{stdout.decode()}'
-    if stderr:
-        return f'[stderr]\n{stderr.decode()}'
+
+    return out or err or True
 
 
-def old_download(url, file_name, chunk_size=1024 * 10):
+def old_download(url, file_name, chunk_size=1024 * 1024):
+    """
+    Simple sync download fallback.
+    """
     if os.path.exists(file_name):
         os.remove(file_name)
-    r = requests.get(url, allow_redirects=True, stream=True)
-    with open(file_name, 'wb') as fd:
-        for chunk in r.iter_content(chunk_size=chunk_size):
-            if chunk:
-                fd.write(chunk)
+
+    with requests.get(
+        url,
+        allow_redirects=True,
+        stream=True,
+        headers={"User-Agent": USER_AGENT},
+        timeout=60,
+    ) as r:
+        r.raise_for_status()
+        with open(file_name, "wb") as fd:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    fd.write(chunk)
+
     return file_name
 
 
 def human_readable_size(size, decimal_places=2):
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
-        if size < 1024.0 or unit == 'PB':
+    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
+        if size < 1024.0 or unit == "PB":
             break
         size /= 1024.0
     return f"{size:.{decimal_places}f} {unit}"
@@ -85,238 +131,191 @@ def time_name():
     return f"{date} {current_time}.mp4"
 
 
+def find_downloaded_file(name):
+    """
+    Find output file generated by yt-dlp/ffmpeg.
+    """
+    base = os.path.splitext(name)[0]
+
+    candidates = [
+        name,
+        f"{name}.mp4",
+        f"{name}.mkv",
+        f"{name}.webm",
+        f"{base}.mp4",
+        f"{base}.mkv",
+        f"{base}.webm",
+        f"{base}.mp4.webm",
+    ]
+
+    for file in candidates:
+        if os.path.isfile(file):
+            return file
+
+    return None
+
+
 async def download_video(url, cmd, name):
-    time.sleep(2)
-    download_cmd = f'{cmd} -R infinite --fragment-retries 25 --socket-timeout 50 --external-downloader aria2c --downloader-args "aria2c: -x 16 -j 32" --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"'
-    global failed_counter
-    print(download_cmd)
+    """
+    Linux-safe normal video downloader.
+    Works with normal MP4/HLS/non-DRM links through yt-dlp/ffmpeg.
+    """
+    await asyncio.sleep(2)
+
+    aria2_exists = shutil.which("aria2c") is not None
+
+    extra_args = (
+        '-R infinite '
+        '--fragment-retries 25 '
+        '--socket-timeout 50 '
+        f'--user-agent "{USER_AGENT}" '
+    )
+
+    if aria2_exists:
+        extra_args += (
+            '--external-downloader aria2c '
+            '--downloader-args "aria2c: -x 16 -j 16 -s 16" '
+        )
+
+    download_cmd = f"{cmd} {extra_args}"
+
     logging.info(download_cmd)
-    k = subprocess.run(download_cmd, shell=True)
-    if "visionias" in cmd and k.returncode != 0 and failed_counter <= 10:
-        failed_counter += 1
-        await asyncio.sleep(5)
-        await download_video(url, cmd, name)
-    failed_counter = 0
-    try:
-        if os.path.isfile(name):
-            return name
-        elif os.path.isfile(f"{name}.webm"):
-            return f"{name}.webm"
-        name = name.split(".")[0]
-        if os.path.isfile(f"{name}.mkv"):
-            return f"{name}.mkv"
-        elif os.path.isfile(f"{name}.mp4"):
-            return f"{name}.mp4"
-        elif os.path.isfile(f"{name}.mp4.webm"):
-            return f"{name}.mp4.webm"
+    print(download_cmd)
 
-        return name
-    except FileNotFoundError as exc:
-        return os.path.isfile.splitext[0] + "." + "mp4"
+    max_attempts = 3
+    attempt = 0
 
+    while attempt < max_attempts:
+        attempt += 1
 
+        proc = await asyncio.create_subprocess_shell(
+            download_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
+        stdout, stderr = await proc.communicate()
 
+        if stdout:
+            logging.info(stdout.decode(errors="ignore"))
+        if stderr:
+            logging.error(stderr.decode(errors="ignore"))
 
-async def get_pssh_kid(mpd_url: str, headers: dict = {}, cookies: dict = {}):
-    """
-    Get pssh, kid from mpd url
-    headers: Headers if needed
-    """
-    pssh = ""
-    kid = ""
-    for i in range(3):
-        try:
-            async with httpx.AsyncClient() as client:
-                res = await client.get(mpd_url, headers=headers, cookies=cookies)
-                mpd_res = res.text
-        except Exception as e:
-            print("Error fetching MPD:", e)
-            continue
-        try:
-            matches = re.finditer("<cenc:pssh>(.*)</cenc:pssh>", mpd_res)
-            pssh = next(matches).group(1)
-            kid = re.findall(r'default_KID="([\S]+)"', mpd_res)[0].replace("-", "")
-        except Exception as e:
-            print("Error extracting PSSH or KID:", e)
-            continue
-        else:
+        found = find_downloaded_file(name)
+
+        if proc.returncode == 0 and found:
+            return found
+
+        if "visionias" not in cmd.lower():
             break
-    return pssh, kid
+
+        await asyncio.sleep(5)
+
+    found = find_downloaded_file(name)
+    if found:
+        return found
+
+    return None
 
 
-class Penpencil:
-    otp_url = "https://api.penpencil.xyz/v1/videos/get-otp?key="
-    penpencil_bearer = f'{pw_token}'
+async def hls_download_ffmpeg(url, name):
+    """
+    Download non-DRM m3u8/HLS using ffmpeg.
+    """
+    output = f"{name}.mp4"
 
-    headers = {
-        "Host": "api.penpencil.xyz",
-        "content-type": "application/json",
-        "authorization": f"Bearer {pw_token}",
-        "client-version": "11",
-        "user-agent": "Mozilla/5.0 (Linux; Android 10; PACM00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.98 Mobile Safari/537.36",
-        "Client-Type": "WEB",
-        "accept-encoding": "gzip",
-    }
+    cmd = (
+        f'ffmpeg -y '
+        f'-headers "User-Agent: {USER_AGENT}\\r\\n" '
+        f'-i "{url}" '
+        f'-c copy '
+        f'-bsf:a aac_adtstoasc '
+        f'"{output}"'
+    )
 
-    @classmethod
-    def encode_utf16_hex(cls, input_string: str) -> str:
-        hex_string = ''.join(f"{ord(char):04x}" for char in input_string)
-        return hex_string
+    ok = await run(cmd)
 
-    @classmethod
-    def get_otp_key(cls, kid: str):
-        xor_bytes = bytes(
-            [
-                ord(kid[i]) ^ ord(cls.penpencil_bearer[i % len(cls.penpencil_bearer)])
-                for i in range(len(kid))
-            ]
-        )
-        f = base64.b64encode(xor_bytes).decode("utf-8")
-        print(f"Generated OTP Key: {f}")
-        return f
+    if ok and os.path.exists(output):
+        return output
 
-    @classmethod
-    def get_key(cls, otp: str):
-        a = base64.b64decode(otp)
-        b = len(a)
-        c = [int(a[i]) for i in range(b)]
-        d = "".join(
-            [
-                chr(c[j] ^ ord(cls.penpencil_bearer[j % len(cls.penpencil_bearer)]))
-                for j in range(b)
-            ]
-        )
-        print(f"Decoded Key: {d}")
-        return d
+    return None
 
-    @classmethod
-    async def get_keys(cls, kid: str):
-        otp_key = cls.get_otp_key(kid)
-        encoded_hex = cls.encode_utf16_hex(otp_key)
-        print(f"Encoded Hex: {encoded_hex}")
-
-        keys = []
-        for i in range(3):
-            try:
-                async with httpx.AsyncClient(headers=cls.headers) as client:
-                    otp_url = f"{cls.otp_url}{encoded_hex}&isEncoded=true"
-                    resp = await client.get(otp_url)
-                    otp_dict = resp.json()
-            except Exception as e:
-                print("Error fetching OTP:", e)
-                continue
-            try:
-                otp = otp_dict["data"]["otp"]
-                print(f"Received OTP: {otp}")
-                key = cls.get_key(otp)
-                keys = f"{kid}:{key}"
-            except Exception as e:
-                print("Error extracting key:", e)
-                continue
-            else:
-                break
-        return keys
-
-    @classmethod
-    async def get_mpd_title(cls, url: str):
-        return url
-
-    @classmethod
-    async def get_mpd_keys_title(cls, url: str, keys: list = []):
-        mpd_url = await cls.get_mpd_title(url)
-        if keys:
-            return mpd_url
-        if mpd_url:
-            pssh, kid = await get_pssh_kid(mpd_url)
-            print("PSSH:", pssh)
-            print("KID:", kid)
-
-            # keys = await cls.get_keys(kid)
-            # print("Keys:", keys)
-
-            key = await cls.get_keys(kid)
-            print("Key:", key)
-        return mpd_url, key
 
 async def get_drm_keys(url: str):
-    mpd_url, key = await Penpencil.get_mpd_keys_title(url)
-    return key
+    """
+    DRM key extraction is not supported.
+    """
+    raise RuntimeError(
+        "DRM key extraction/decryption is not supported in this Linux-safe version."
+    )
+
 
 async def drm_download_video(url, qual, name, keys):
-
-    print(keys)
-    keys = keys.split(":")
-    if len(keys) != 2:
-        print("Error: Two keys must be provided separated by a colon.")
-        return None
-    key1, key2 = keys
-
-
-    if qual =="1":
-        nqual="720"
-
-    elif qual=="2":
-        nqual= "480" 
-
-    elif qual =="3":
-        nqual="360"
-
-    elif qual=="4":
-        nqual="240"
-    else :
-        nqual="480"                
-  
-    try:
-        # Get the directory of the current script
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Path to N_m3u8DL-RE
-        n_m3u8dl_re_path = os.path.join(current_dir, "N_m3u8DL-RE.exe")
+    """
+    DRM download/decryption is not supported.
+    """
+    raise RuntimeError(
+        "DRM-protected video download/decryption is not supported."
+    )
 
 
-        # Use N_m3u8DL-RE for decryption
-        nurl = url.replace("master",f"master_{nqual}")
-        subprocess.run([n_m3u8dl_re_path, "--auto-select", "--key", f"{key1}:{key2}", nurl, "-mt", "-M", "format=mp4", "--save-name", name], check=True)
-
-        # Verify download
-        result = os.system(f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{name}.mp4"')
-        if result != 0:
-            print("Verification of the downloaded video failed.")
-            return None
-
-        print(f"Decryption and download successful with key {key1}.")
-        return f"{name}.mp4"
-
-    except FileNotFoundError as exc:
-        print(f"File not found: {exc}")
-        return os.path.splitext(name)[0] + ".mp4", None
-
-   
-
-    
-async def send_vid(bot: Client, m: Message, cc, filename, thumb, name,thumb2):
+async def send_vid(bot: Client, m: Message, cc, filename, thumb, name, thumb2):
     reply = await m.reply_text(f"**⚡️ Starting Uploading ...** - `{name}`")
+
+    thumbnail = "thumb1.jpg"
+
     try:
-        if thumb != "no":
-            subprocess.run(['wget', thumb2, '-O', 'thumb1.jpg'], check=True)  # Fixing this line
-            thumbnail = "thumb1.jpg"
+        if thumb != "no" and thumb2:
+            cmd = f'wget -q "{thumb2}" -O "{thumbnail}"'
+            subprocess.run(cmd, shell=True, check=True)
         else:
-            subprocess.run(f'ffmpeg -i "{filename}" -ss 00:00:12 -vframes 1 "thumb1.jpg"', shell=True)
-            thumbnail = "thumb1.jpg"
-            
+            cmd = (
+                f'ffmpeg -y -i "{filename}" '
+                f'-ss 00:00:12 -vframes 1 "{thumbnail}"'
+            )
+            subprocess.run(cmd, shell=True, check=True)
     except Exception as e:
-        await m.reply_text(str(e))
+        logging.error(f"Thumbnail error: {e}")
+        thumbnail = None
 
-    dur = int(duration(filename))
-
+    dur = duration(filename)
     start_time = time.time()
 
     try:
-        await m.reply_video(filename, caption=cc, supports_streaming=True, height=720, width=1280, thumb=thumbnail, duration=dur, progress=progress_bar, progress_args=(reply, start_time))
-    except Exception:
-        await m.reply_document(filename, caption=cc, thumb=thumbnail, progress=progress_bar, progress_args=(reply, start_time))
+        await m.reply_video(
+            filename,
+            caption=cc,
+            supports_streaming=True,
+            height=720,
+            width=1280,
+            thumb=thumbnail if thumbnail and os.path.exists(thumbnail) else None,
+            duration=dur,
+            progress=progress_bar,
+            progress_args=(reply, start_time),
+        )
+    except Exception as e:
+        logging.error(f"Video upload failed, sending as document: {e}")
+        await m.reply_document(
+            filename,
+            caption=cc,
+            thumb=thumbnail if thumbnail and os.path.exists(thumbnail) else None,
+            progress=progress_bar,
+            progress_args=(reply, start_time),
+        )
 
-    os.remove(filename)
-    os.remove(thumbnail)
-    await reply.delete(True)
+    try:
+        if filename and os.path.exists(filename):
+            os.remove(filename)
+    except Exception:
+        pass
+
+    try:
+        if thumbnail and os.path.exists(thumbnail):
+            os.remove(thumbnail)
+    except Exception:
+        pass
+
+    try:
+        await reply.delete(True)
+    except Exception:
+        pass
